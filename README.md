@@ -11,7 +11,6 @@ This project is developed for the Operating Systems (OS) lab course. The goal is
 - Concurrency & synchronization demonstrations  
 - Test suite for validating each module  
 
-*(Modify this list based on what your actual project implements.)*
 
 ## 🛠️ Requirements & Setup  
 1. Ensure you have a C compiler (e.g., `gcc`) and `make` installed.  
