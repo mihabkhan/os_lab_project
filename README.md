@@ -1,7 +1,6 @@
 ## 📌 Overview  # OS Lab Project
 
 **Project:** OS Lab Project  
-**Author:** Mihab Khan  
 **Repository:** [mihabkhan/os_lab_project](https://github.com/mihabkhan/os_lab_project)
 This project is developed for the Operating Systems (OS) lab course. The goal is to implement, test and demonstrate various OS-level concepts (such as scheduling, memory management, file systems, etc.) through hands-on code and simulations.
 
