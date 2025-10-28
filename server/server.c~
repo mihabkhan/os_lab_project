@@ -1,0 +1,605 @@
+cat > server/server.c <<'EOF'
+/*
+ Phase-1: Simple Dropbox Clone - single-file server
+ - Accept loop -> Client Queue -> Client Threadpool -> Task Queue -> Worker Threadpool
+ - Worker threads perform file I/O and send responses directly to client sockets.
+ - Client threads enqueue tasks and wait on per-task condition variable for completion.
+*/
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define PORT 9000
+#define BACKLOG 128
+#define CLIENT_POOL_SIZE 4
+#define WORKER_POOL_SIZE 4
+#define MAX_USERNAME 64
+#define MAX_FILENAME 256
+#define DEFAULT_QUOTA_BYTES (100*1024*1024) // 100 MB
+
+/* -------------------- utility I/O helpers -------------------- */
+static ssize_t recv_line(int sock, char *buf, size_t maxlen) {
+    size_t n = 0;
+    char c;
+    while (n + 1 < maxlen) {
+        ssize_t r = recv(sock, &c, 1, 0);
+        if (r <= 0) {
+            if (r == 0 && n==0) return 0;
+            return -1;
+        }
+        buf[n++] = c;
+        if (c == '\n') break;
+    }
+    buf[n] = '\0';
+    return (ssize_t)n;
+}
+
+static ssize_t recv_all(int sock, void *buf, size_t len) {
+    size_t total = 0;
+    char *p = buf;
+    while (total < len) {
+        ssize_t r = recv(sock, p + total, len - total, 0);
+        if (r <= 0) return -1;
+        total += r;
+    }
+    return (ssize_t)total;
+}
+
+static ssize_t send_all(int sock, const void *buf, size_t len) {
+    size_t total = 0;
+    const char *p = buf;
+    while (total < len) {
+        ssize_t s = send(sock, p + total, len - total, 0);
+        if (s <= 0) return -1;
+        total += s;
+    }
+    return (ssize_t)total;
+}
+
+/* -------------------- Client Queue (sock ints) -------------------- */
+typedef struct ClientNode {
+    int sock;
+    struct ClientNode *next;
+} ClientNode;
+
+typedef struct {
+    ClientNode *head, *tail;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_nonempty;
+} ClientQueue;
+
+static void client_queue_init(ClientQueue *q) {
+    q->head = q->tail = NULL;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond_nonempty, NULL);
+}
+static void client_queue_push(ClientQueue *q, int sock) {
+    ClientNode *n = malloc(sizeof(ClientNode));
+    n->sock = sock; n->next = NULL;
+    pthread_mutex_lock(&q->mutex);
+    if (!q->tail) q->head = n;
+    else q->tail->next = n;
+    q->tail = n;
+    pthread_cond_signal(&q->cond_nonempty);
+    pthread_mutex_unlock(&q->mutex);
+}
+static int client_queue_pop(ClientQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (!q->head) {
+        pthread_cond_wait(&q->cond_nonempty, &q->mutex);
+    }
+    ClientNode *n = q->head;
+    int sock = n->sock;
+    q->head = n->next;
+    if (!q->head) q->tail = NULL;
+    pthread_mutex_unlock(&q->mutex);
+    free(n);
+    return sock;
+}
+
+/* -------------------- Task queue -------------------- */
+typedef enum { TASK_UPLOAD=1, TASK_DOWNLOAD=2, TASK_DELETE=3, TASK_LIST=4 } task_type_t;
+
+typedef struct Task {
+    int client_sock;
+    char username[MAX_USERNAME];
+    task_type_t type;
+    char filename[MAX_FILENAME];
+    size_t filesize;
+    int result_code; // 0 = pending, 1 = success, -1 = error
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    struct Task *next;
+} Task;
+
+typedef struct {
+    Task *head, *tail;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_nonempty;
+} TaskQueue;
+
+static void task_queue_init(TaskQueue *q) {
+    q->head = q->tail = NULL;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond_nonempty, NULL);
+}
+static void task_queue_push(TaskQueue *q, Task *t) {
+    t->next = NULL;
+    pthread_mutex_lock(&q->mutex);
+    if (!q->tail) q->head = t;
+    else q->tail->next = t;
+    q->tail = t;
+    pthread_cond_signal(&q->cond_nonempty);
+    pthread_mutex_unlock(&q->mutex);
+}
+static Task *task_queue_pop(TaskQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (!q->head) {
+        pthread_cond_wait(&q->cond_nonempty, &q->mutex);
+    }
+    Task *t = q->head;
+    q->head = t->next;
+    if (!q->head) q->tail = NULL;
+    pthread_mutex_unlock(&q->mutex);
+    return t;
+}
+
+/* -------------------- User metadata -------------------- */
+typedef struct FileEntry {
+    char name[MAX_FILENAME];
+    size_t size;
+    struct FileEntry *next;
+} FileEntry;
+
+typedef struct User {
+    char username[MAX_USERNAME];
+    size_t quota_bytes;
+    size_t used_bytes;
+    FileEntry *files;
+    pthread_mutex_t lock;
+    struct User *next;
+} User;
+
+static User *users_head = NULL;
+static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static User *find_user(const char *username) {
+    pthread_mutex_lock(&users_mutex);
+    User *u = users_head;
+    while (u) {
+        if (strcmp(u->username, username) == 0) break;
+        u = u->next;
+    }
+    pthread_mutex_unlock(&users_mutex);
+    return u;
+}
+
+static int create_user(const char *username) {
+    pthread_mutex_lock(&users_mutex);
+    User *u = users_head;
+    while (u) { if (strcmp(u->username, username)==0) { pthread_mutex_unlock(&users_mutex); return -1; } u=u->next; }
+    User *nu = calloc(1, sizeof(User));
+    strncpy(nu->username, username, sizeof(nu->username)-1);
+    nu->quota_bytes = DEFAULT_QUOTA_BYTES;
+    nu->used_bytes = 0;
+    nu->files = NULL;
+    pthread_mutex_init(&nu->lock, NULL);
+    nu->next = users_head;
+    users_head = nu;
+    pthread_mutex_unlock(&users_mutex);
+    // create storage/<username> dir
+    char path[512];
+    snprintf(path, sizeof(path), "storage/%s", username);
+    mkdir("storage", 0755); // ignore if exists
+    mkdir(path, 0755);
+    return 0;
+}
+
+static void add_file_to_user(User *u, const char *fname, size_t fsize) {
+    FileEntry *fe = malloc(sizeof(FileEntry));
+    strncpy(fe->name, fname, sizeof(fe->name)-1);
+    fe->size = fsize;
+    fe->next = u->files;
+    u->files = fe;
+    u->used_bytes += fsize;
+}
+static int remove_file_from_user(User *u, const char *fname) {
+    FileEntry *prev = NULL, *cur = u->files;
+    while (cur) {
+        if (strcmp(cur->name, fname) == 0) {
+            if (prev) prev->next = cur->next;
+            else u->files = cur->next;
+            u->used_bytes -= cur->size;
+            free(cur);
+            return 0;
+        }
+        prev = cur; cur = cur->next;
+    }
+    return -1;
+}
+
+/* -------------------- Globals -------------------- */
+static ClientQueue client_q;
+static TaskQueue task_q;
+
+/* -------------------- Worker thread -------------------- */
+static void handle_upload(Task *t) {
+    // create temp file and write incoming bytes
+    char userdir[512], tmp[512], final[512];
+    snprintf(userdir, sizeof(userdir), "storage/%s", t->username);
+    snprintf(tmp, sizeof(tmp), "%s/.tmp_%lu_%ld", userdir, (unsigned long)pthread_self(), random());
+    snprintf(final, sizeof(final), "%s/%s", userdir, t->filename);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        const char *err = "ERR cannot_create_tmp\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+
+    size_t left = t->filesize;
+    char buf[4096];
+    int read_ok = 1;
+    while (left) {
+        size_t toread = (left > sizeof(buf) ? sizeof(buf) : left);
+        ssize_t r = recv_all(t->client_sock, buf, toread);
+        if (r <= 0) { read_ok = 0; break; }
+        size_t w = fwrite(buf, 1, r, f);
+        if (w != (size_t)r) { read_ok = 0; break; }
+        left -= r;
+    }
+    fclose(f);
+    if (!read_ok) {
+        unlink(tmp);
+        const char *err = "ERR upload_recv_failed\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+
+    // check quota and move file atomically
+    User *u = find_user(t->username);
+    if (!u) {
+        unlink(tmp);
+        const char *err = "ERR user_not_found\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    pthread_mutex_lock(&u->lock);
+    if (u->used_bytes + t->filesize > u->quota_bytes) {
+        pthread_mutex_unlock(&u->lock);
+        unlink(tmp);
+        const char *err = "ERR quota_exceeded\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    // rename
+    if (rename(tmp, final) != 0) {
+        pthread_mutex_unlock(&u->lock);
+        unlink(tmp);
+        const char *err = "ERR rename_failed\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    add_file_to_user(u, t->filename, t->filesize);
+    pthread_mutex_unlock(&u->lock);
+
+    const char *ok = "OK\n";
+    send_all(t->client_sock, ok, strlen(ok));
+    t->result_code = 1;
+}
+
+static void handle_download(Task *t) {
+    char path[512];
+    snprintf(path, sizeof(path), "storage/%s/%s", t->username, t->filename);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        const char *err = "ERR not_found\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    size_t sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char header[128];
+    snprintf(header, sizeof(header), "OK %zu\n", sz);
+    if (send_all(t->client_sock, header, strlen(header)) < 0) { fclose(f); t->result_code = -1; return; }
+    char buf[4096];
+    size_t left = sz;
+    while (left) {
+        size_t r = fread(buf, 1, (left > sizeof(buf) ? sizeof(buf) : left), f);
+        if (r == 0) break;
+        if (send_all(t->client_sock, buf, r) < 0) { fclose(f); t->result_code = -1; return; }
+        left -= r;
+    }
+    fclose(f);
+    t->result_code = 1;
+}
+
+static void handle_delete(Task *t) {
+    User *u = find_user(t->username);
+    if (!u) {
+        const char *err = "ERR user_not_found\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    pthread_mutex_lock(&u->lock);
+    // find file size to update used_bytes
+    FileEntry *cur = u->files;
+    size_t fsize = 0;
+    while (cur) { if (strcmp(cur->name, t->filename) == 0) { fsize = cur->size; break; } cur = cur->next; }
+    if (fsize == 0) {
+        pthread_mutex_unlock(&u->lock);
+        const char *err = "ERR not_found\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    // remove metadata entry
+    remove_file_from_user(u, t->filename);
+    pthread_mutex_unlock(&u->lock);
+    // unlink file
+    char path[512];
+    snprintf(path, sizeof(path), "storage/%s/%s", t->username, t->filename);
+    unlink(path);
+    const char *ok = "OK\n";
+    send_all(t->client_sock, ok, strlen(ok));
+    t->result_code = 1;
+}
+
+static void handle_list(Task *t) {
+    User *u = find_user(t->username);
+    if (!u) {
+        const char *err = "ERR user_not_found\n";
+        send_all(t->client_sock, err, strlen(err));
+        t->result_code = -1;
+        return;
+    }
+    pthread_mutex_lock(&u->lock);
+    FileEntry *f = u->files;
+    char line[512];
+    while (f) {
+        snprintf(line, sizeof(line), "%s %zu\n", f->name, f->size);
+        if (send_all(t->client_sock, line, strlen(line)) < 0) { pthread_mutex_unlock(&u->lock); t->result_code = -1; return; }
+        f = f->next;
+    }
+    pthread_mutex_unlock(&u->lock);
+    const char *end = "END\n";
+    send_all(t->client_sock, end, strlen(end));
+    t->result_code = 1;
+}
+
+static void *worker_thread_fn(void *arg) {
+    (void)arg;
+    while (1) {
+        Task *t = task_queue_pop(&task_q);
+        if (!t) continue;
+        if (t->type == TASK_UPLOAD) handle_upload(t);
+        else if (t->type == TASK_DOWNLOAD) handle_download(t);
+        else if (t->type == TASK_DELETE) handle_delete(t);
+        else if (t->type == TASK_LIST) handle_list(t);
+        else {
+            const char *err = "ERR unknown_task\n";
+            send_all(t->client_sock, err, strlen(err));
+            t->result_code = -1;
+        }
+        // signal client thread waiting on this task
+        pthread_mutex_lock(&t->mutex);
+        pthread_cond_signal(&t->cond);
+        pthread_mutex_unlock(&t->mutex);
+        // do not free t here — client thread will free after wake
+    }
+    return NULL;
+}
+
+/* -------------------- Client thread -------------------- */
+static void *client_thread_fn(void *arg) {
+    (void)arg;
+    char line[512];
+    while (1) {
+        int sock = client_queue_pop(&client_q);
+        if (sock < 0) continue;
+        // authentication
+        ssize_t n = recv_line(sock, line, sizeof(line));
+        if (n <= 0) { close(sock); continue; }
+        // expect: SIGNUP <username>\n or LOGIN <username>\n
+        char cmd[16], username[MAX_USERNAME];
+        if (sscanf(line, "%15s %63s", cmd, username) != 2) {
+            const char *err = "ERR invalid_auth\n";
+            send_all(sock, err, strlen(err));
+            close(sock);
+            continue;
+        }
+        if (strcmp(cmd, "SIGNUP") == 0) {
+            if (create_user(username) != 0) {
+                const char *err = "ERR user_exists\n";
+                send_all(sock, err, strlen(err));
+                close(sock);
+                continue;
+            } else {
+                const char *ok = "OK\n";
+                send_all(sock, ok, strlen(ok));
+            }
+        } else if (strcmp(cmd, "LOGIN") == 0) {
+            if (!find_user(username)) {
+                const char *err = "ERR no_such_user\n";
+                send_all(sock, err, strlen(err));
+                close(sock);
+                continue;
+            } else {
+                const char *ok = "OK\n";
+                send_all(sock, ok, strlen(ok));
+            }
+        } else {
+            const char *err = "ERR invalid_auth_cmd\n";
+            send_all(sock, err, strlen(err));
+            close(sock);
+            continue;
+        }
+
+        // Now authenticated; handle commands
+        while (1) {
+            ssize_t m = recv_line(sock, line, sizeof(line));
+            if (m <= 0) break; // client closed
+            // parse commands: UPLOAD <filename> <filesize>\n
+            if (strncmp(line, "UPLOAD ", 7) == 0) {
+                char fname[MAX_FILENAME];
+                size_t fsize = 0;
+                if (sscanf(line+7, "%255s %zu", fname, &fsize) != 2) {
+                    const char *err = "ERR bad_upload_syntax\n";
+                    send_all(sock, err, strlen(err));
+                    continue;
+                }
+                Task *t = calloc(1, sizeof(Task));
+                t->client_sock = sock;
+                strncpy(t->username, username, sizeof(t->username)-1);
+                t->type = TASK_UPLOAD;
+                strncpy(t->filename, fname, sizeof(t->filename)-1);
+                t->filesize = fsize;
+                t->result_code = 0;
+                pthread_mutex_init(&t->mutex, NULL);
+                pthread_cond_init(&t->cond, NULL);
+                task_queue_push(&task_q, t);
+                // wait for worker to complete and signal
+                pthread_mutex_lock(&t->mutex);
+                while (t->result_code == 0) pthread_cond_wait(&t->cond, &t->mutex);
+                pthread_mutex_unlock(&t->mutex);
+                // worker already sent response; free task
+                pthread_cond_destroy(&t->cond);
+                pthread_mutex_destroy(&t->mutex);
+                free(t);
+            } else if (strncmp(line, "DOWNLOAD ", 9) == 0) {
+                char fname[MAX_FILENAME];
+                if (sscanf(line+9, "%255s", fname) != 1) {
+                    const char *err = "ERR bad_download_syntax\n";
+                    send_all(sock, err, strlen(err));
+                    continue;
+                }
+                Task *t = calloc(1, sizeof(Task));
+                t->client_sock = sock;
+                strncpy(t->username, username, sizeof(t->username)-1);
+                t->type = TASK_DOWNLOAD;
+                strncpy(t->filename, fname, sizeof(t->filename)-1);
+                t->result_code = 0;
+                pthread_mutex_init(&t->mutex, NULL);
+                pthread_cond_init(&t->cond, NULL);
+                task_queue_push(&task_q, t);
+                pthread_mutex_lock(&t->mutex);
+                while (t->result_code == 0) pthread_cond_wait(&t->cond, &t->mutex);
+                pthread_mutex_unlock(&t->mutex);
+                pthread_cond_destroy(&t->cond);
+                pthread_mutex_destroy(&t->mutex);
+                free(t);
+            } else if (strncmp(line, "DELETE ", 7) == 0) {
+                char fname[MAX_FILENAME];
+                if (sscanf(line+7, "%255s", fname) != 1) {
+                    const char *err = "ERR bad_delete_syntax\n";
+                    send_all(sock, err, strlen(err));
+                    continue;
+                }
+                Task *t = calloc(1, sizeof(Task));
+                t->client_sock = sock;
+                strncpy(t->username, username, sizeof(t->username)-1);
+                t->type = TASK_DELETE;
+                strncpy(t->filename, fname, sizeof(t->filename)-1);
+                t->result_code = 0;
+                pthread_mutex_init(&t->mutex, NULL);
+                pthread_cond_init(&t->cond, NULL);
+                task_queue_push(&task_q, t);
+                pthread_mutex_lock(&t->mutex);
+                while (t->result_code == 0) pthread_cond_wait(&t->cond, &t->mutex);
+                pthread_mutex_unlock(&t->mutex);
+                pthread_cond_destroy(&t->cond);
+                pthread_mutex_destroy(&t->mutex);
+                free(t);
+            } else if (strncmp(line, "LIST", 4) == 0) {
+                Task *t = calloc(1, sizeof(Task));
+                t->client_sock = sock;
+                strncpy(t->username, username, sizeof(t->username)-1);
+                t->type = TASK_LIST;
+                t->result_code = 0;
+                pthread_mutex_init(&t->mutex, NULL);
+                pthread_cond_init(&t->cond, NULL);
+                task_queue_push(&task_q, t);
+                pthread_mutex_lock(&t->mutex);
+                while (t->result_code == 0) pthread_cond_wait(&t->cond, &t->mutex);
+                pthread_mutex_unlock(&t->mutex);
+                pthread_cond_destroy(&t->cond);
+                pthread_mutex_destroy(&t->mutex);
+                free(t);
+            } else {
+                const char *err = "ERR unknown_command\n";
+                send_all(sock, err, strlen(err));
+            }
+        } // end per-client loop
+        close(sock);
+    } // end forever
+    return NULL;
+}
+
+/* -------------------- main -------------------- */
+int main(int argc, char **argv) {
+    srand((unsigned int)time(NULL));
+    // create storage root
+    mkdir("storage", 0755);
+
+    client_queue_init(&client_q);
+    task_queue_init(&task_q);
+
+    // ignore SIGPIPE so send() to closed sockets doesn't kill process
+    signal(SIGPIPE, SIG_IGN);
+
+    // start client threadpool
+    pthread_t client_pool[CLIENT_POOL_SIZE];
+    for (int i = 0; i < CLIENT_POOL_SIZE; ++i) {
+        if (pthread_create(&client_pool[i], NULL, client_thread_fn, NULL) != 0) {
+            perror("pthread_create client");
+            exit(1);
+        }
+    }
+    // start worker pool
+    pthread_t worker_pool[WORKER_POOL_SIZE];
+    for (int i = 0; i < WORKER_POOL_SIZE; ++i) {
+        if (pthread_create(&worker_pool[i], NULL, worker_thread_fn, NULL) != 0) {
+            perror("pthread_create worker");
+            exit(1);
+        }
+    }
+
+    // setup listen socket
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd < 0) { perror("socket"); exit(1); }
+    int opt = 1;
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
+    if (bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
+    if (listen(listenfd, BACKLOG) < 0) { perror("listen"); exit(1); }
+    printf("server listening on port %d\n", PORT);
+
+    while (1) {
+        int client = accept(listenfd, NULL, NULL);
+        if (client < 0) continue;
+        client_queue_push(&client_q, client);
+    }
+    close(listenfd);
+    return 0;
+}
+EOF
